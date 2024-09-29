@@ -166,18 +166,17 @@ def main(config):
     print("Logdir", logdir)
     logdir.mkdir(parents=True, exist_ok=True)
     # step in logger is environmental step
-    print("Action Space", config.action_dim )
-    config.num_actions = 2
-
+    config.num_actions = config.action_dim * config.frameskip
+    print("Action Space", config.num_actions )
     # here we should load the dataset
-    datasets, traj_dset = load_pusht_slice_train_val(data_path = '/data/jeff/workspace/pusht_dataset', with_velocity=False,n_rollout=5, transform=resize_image, frameskip=1, num_hist=config.batch_length)
+    datasets, traj_dset = load_pusht_slice_train_val(data_path = '/data/jeff/workspace/pusht_dataset', with_velocity=False, transform=resize_image, frameskip=config.frameskip, num_hist=config.batch_length)
     train_dataset = datasets['train']
     eval_dataset = datasets['valid']
     train_dataset = DataLoader(train_dataset,batch_size=config.batch_size, shuffle=True)
     eval_dataset = iter(DataLoader(eval_dataset,batch_size=config.batch_size, shuffle=True))
     agent = Dreamer(
         (64, 64, 3), # obs_space
-        (config.action_dim ,), # act_space
+        (config.num_actions ,), # act_space
         config,
         None,
         train_dataset,
