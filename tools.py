@@ -249,6 +249,130 @@ def simulate(
     return (step - steps, episode - episodes, done, length, obs, agent_state, reward)
 
 
+def simulate_without_env(
+    agent,
+    envs,
+    cache,
+    directory,
+    logger,
+    is_eval=False,
+    limit=None,
+    steps=0,
+    episodes=0,
+    state=None,
+):
+    # initialize or unpack simulation state
+    if state is None:
+        step, episode = 0, 0
+        done = np.ones(len(envs), bool)
+        length = np.zeros(len(envs), np.int32)
+        obs = [None] * len(envs)
+        agent_state = None
+        reward = [0] * len(envs)
+    else:
+        step, episode, done, length, obs, agent_state, reward = state
+    while (steps and step < steps) or (episodes and episode < episodes):
+        # reset envs if necessary
+        if done.any():
+            indices = [index for index, d in enumerate(done) if d]
+            results = [envs[i].reset() for i in indices]
+            results = [r() for r in results]
+            for index, result in zip(indices, results):
+                t = result.copy()
+                t = {k: convert(v) for k, v in t.items()}
+                # action will be added to transition in add_to_cache
+                t["reward"] = 0.0
+                t["discount"] = 1.0
+                # initial state should be added to cache
+                add_to_cache(cache, envs[index].id, t)
+                # replace obs with done by initial state
+                obs[index] = result
+        # step agents
+        obs = {k: np.stack([o[k] for o in obs]) for k in obs[0] if "log_" not in k}
+        action, agent_state = agent(obs, done, agent_state)
+        if isinstance(action, dict):
+            action = [
+                {k: np.array(action[k][i].detach().cpu()) for k in action}
+                for i in range(len(envs))
+            ]
+        else:
+            action = np.array(action)
+        assert len(action) == len(envs)
+        # step envs
+        results = [e.step(a) for e, a in zip(envs, action)]
+        results = [r() for r in results]
+        obs, reward, done = zip(*[p[:3] for p in results])
+        obs = list(obs)
+        reward = list(reward)
+        done = np.stack(done)
+        episode += int(done.sum())
+        length += 1
+        step += len(envs)
+        length *= 1 - done
+        # add to cache
+        for a, result, env in zip(action, results, envs):
+            o, r, d, info = result
+            o = {k: convert(v) for k, v in o.items()}
+            transition = o.copy()
+            if isinstance(a, dict):
+                transition.update(a)
+            else:
+                transition["action"] = a
+            transition["reward"] = r
+            transition["discount"] = info.get("discount", np.array(1 - float(d)))
+            add_to_cache(cache, env.id, transition)
+
+        if done.any():
+            indices = [index for index, d in enumerate(done) if d]
+            # logging for done episode
+            for i in indices:
+                save_episodes(directory, {envs[i].id: cache[envs[i].id]})
+                length = len(cache[envs[i].id]["reward"]) - 1
+                score = float(np.array(cache[envs[i].id]["reward"]).sum())
+                video = cache[envs[i].id]["image"]
+                # record logs given from environments
+                for key in list(cache[envs[i].id].keys()):
+                    if "log_" in key:
+                        logger.scalar(
+                            key, float(np.array(cache[envs[i].id][key]).sum())
+                        )
+                        # log items won't be used later
+                        cache[envs[i].id].pop(key)
+
+                if not is_eval:
+                    step_in_dataset = erase_over_episodes(cache, limit)
+                    logger.scalar(f"dataset_size", step_in_dataset)
+                    logger.scalar(f"train_return", score)
+                    logger.scalar(f"train_length", length)
+                    logger.scalar(f"train_episodes", len(cache))
+                    logger.write(step=logger.step)
+                else:
+                    if not "eval_lengths" in locals():
+                        eval_lengths = []
+                        eval_scores = []
+                        eval_done = False
+                    # start counting scores for evaluation
+                    eval_scores.append(score)
+                    eval_lengths.append(length)
+
+                    score = sum(eval_scores) / len(eval_scores)
+                    length = sum(eval_lengths) / len(eval_lengths)
+                    logger.video(f"eval_policy", np.array(video)[None])
+
+                    if len(eval_scores) >= episodes and not eval_done:
+                        logger.scalar(f"eval_return", score)
+                        logger.scalar(f"eval_length", length)
+                        logger.scalar(f"eval_episodes", len(eval_scores))
+                        logger.write(step=logger.step)
+                        eval_done = True
+    if is_eval:
+        # keep only last item for saving memory. this cache is used for video_pred later
+        while len(cache) > 1:
+            # FIFO
+            cache.popitem(last=False)
+    return (step - steps, episode - episodes, done, length, obs, agent_state, reward)
+
+
 def add_to_cache(cache, id, transition):
     if id not in cache:
         cache[id] = dict()
