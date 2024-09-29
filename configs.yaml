@@ -1,6 +1,18 @@
 defaults:
 
-  logdir: null
+  # FOR OUR USE!!!!
+  action_dim: 2
+  task: 'pusht'
+  epochs: 2000
+  run_idx: 0
+  continue_training: False
+  save_video_every: 20
+  save_accumulated_metric_every: 20
+  batch_length: 64 # this is num_hist in our case
+  batch_size: 16
+  # END FOR
+
+  logdir: '/home/gary/dreamerv3-torch'
   traindir: null
   evaldir: null
   offline_traindir: ''
@@ -20,7 +32,6 @@ defaults:
   video_pred_log: True
 
   # Environment
-  task: 'dmc_walker_walk'
   size: [64, 64]
   envs: 1
   action_repeat: 2
@@ -38,7 +49,7 @@ defaults:
   dyn_mean_act: 'none'
   dyn_std_act: 'sigmoid2'
   dyn_min_std: 0.1
-  grad_heads: ['decoder', 'reward', 'cont']
+  grad_heads: ['decoder', 'cont']
   units: 512
   act: 'SiLU'
   norm: True
@@ -62,8 +73,6 @@ defaults:
   initial: 'learned'
 
   # Training
-  batch_size: 16
-  batch_length: 64
   train_ratio: 512
   pretrain: 100
   model_lr: 1e-4
