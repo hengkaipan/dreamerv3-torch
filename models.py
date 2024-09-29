@@ -4,6 +4,7 @@ from torch import nn
 
 import networks
 import tools
+import einops
 
 to_np = lambda x: x.detach().cpu().numpy()
 
@@ -32,7 +33,8 @@ class WorldModel(nn.Module):
         self._step = step
         self._use_amp = True if config.precision == 16 else False
         self._config = config
-        shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
+        # shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
+        shapes = {'image': (64, 64, 3)}
         self.encoder = networks.MultiEncoder(shapes, **config.encoder)
         self.embed_size = self.encoder.outdim
         self.dynamics = networks.RSSM(
@@ -137,6 +139,8 @@ class WorldModel(nn.Module):
                         preds[name] = pred
                 losses = {}
                 for name, pred in preds.items():
+                    if name == "reward":
+                        continue
                     loss = -pred.log_prob(data[name])
                     assert loss.shape == embed.shape[:2], (name, loss.shape)
                     losses[name] = loss
@@ -172,11 +176,27 @@ class WorldModel(nn.Module):
 
     # this function is called during both rollout and training
     def preprocess(self, obs):
+        o, a, s = obs
+        o = o['visual']
+        if o.shape[-1] != 3:
+            if len(o.shape) == 4:
+                o = einops.rearrange(o, "b c h w -> b h w c")
+            else:
+                o = einops.rearrange(o, "b t c h w -> b t h w c")
+        is_first = torch.zeros(a.shape[:-1], dtype=torch.float32)
+        is_first[:, 0] = 1
+        is_terminal = torch.zeros(a.shape[:-1], dtype=torch.float32)
+        is_terminal[:, -1] = 1
+        obs = {
+            "image": o,
+            "action": a,
+            "is_first": is_first,
+            "is_terminal": is_terminal,
+        }
         obs = {
             k: torch.tensor(v, device=self._config.device, dtype=torch.float32)
             for k, v in obs.items()
         }
-        obs["image"] = obs["image"] / 255.0
         if "discount" in obs:
             obs["discount"] *= self._config.discount
             # (batch_size, batch_length) -> (batch_size, batch_length, 1)
