@@ -3,6 +3,9 @@ import functools
 import os
 import pathlib
 import sys
+import pickle
+
+import torchvision.io as tvio
 
 os.environ["MUJOCO_GL"] = "osmesa"
 
@@ -14,16 +17,27 @@ sys.path.append(str(pathlib.Path(__file__).parent))
 import exploration as expl
 import models
 import tools
-import envs.wrappers as wrappers
 from parallel import Parallel, Damy
 
 import torch
 from torch import nn
 from torch import distributions as torchd
 
+import sys
+sys.path.insert(0,'/home/gary/wm_robot')
+from datasets.pusht_dset import PushTDataset, load_pusht_slice_train_val
+from torch.utils.data import DataLoader
+
+from tqdm import tqdm
 
 to_np = lambda x: x.detach().cpu().numpy()
 
+import torchvision.transforms as transforms
+
+def resize_image(image_tensor): # resize the image to 64x64
+    resize_transform = transforms.Resize((64, 64))
+    resized_image = resize_transform(image_tensor)
+    return resized_image
 
 class Dreamer(nn.Module):
     def __init__(self, obs_space, act_space, config, logger, dataset):
@@ -38,7 +52,7 @@ class Dreamer(nn.Module):
         self._should_expl = tools.Until(int(config.expl_until / config.action_repeat))
         self._metrics = {}
         # this is update step
-        self._step = logger.step // config.action_repeat
+        self._step = 1
         self._update_count = 0
         self._dataset = dataset
         self._wm = models.WorldModel(obs_space, act_space, self._step, config)
@@ -64,7 +78,7 @@ class Dreamer(nn.Module):
                 else self._should_train(step)
             )
             for _ in range(steps):
-                self._train(next(self._dataset))
+                self._train(next(iter(self._dataset)))
                 self._update_count += 1
                 self._metrics["update_count"] = self._update_count
             if self._should_log(step):
@@ -72,7 +86,7 @@ class Dreamer(nn.Module):
                     self._logger.scalar(name, float(np.mean(values)))
                     self._metrics[name] = []
                 if self._config.video_pred_log:
-                    openl = self._wm.video_pred(next(self._dataset))
+                    openl = self._wm.video_pred(next(iter(self._dataset)))
                     self._logger.video("train_openl", to_np(openl))
                 self._logger.write(fps=True)
 
@@ -81,7 +95,7 @@ class Dreamer(nn.Module):
         if training:
             self._step += len(reset)
             self._logger.step = self._config.action_repeat * self._step
-        return policy_output, state
+        return
 
     def _policy(self, obs, state, training):
         if state is None:
@@ -118,96 +132,30 @@ class Dreamer(nn.Module):
         metrics = {}
         post, context, mets = self._wm._train(data)
         metrics.update(mets)
-        start = post
-        reward = lambda f, s, a: self._wm.heads["reward"](
-            self._wm.dynamics.get_feat(s)
-        ).mode()
-        metrics.update(self._task_behavior._train(start, reward)[-1])
-        if self._config.expl_behavior != "greedy":
-            mets = self._expl_behavior.train(start, context, data)[-1]
-            metrics.update({"expl_" + key: value for key, value in mets.items()})
         for name, value in metrics.items():
             if not name in self._metrics.keys():
                 self._metrics[name] = [value]
             else:
                 self._metrics[name].append(value)
+        return metrics
+    
+    def train_one_epoch(self):
+        # loop over the dataset
+        all_metrics = []
+        for batch in tqdm(self._dataset):
+            cur_metrics = self._train(batch)
+            all_metrics.append(cur_metrics)
+        return all_metrics
 
 
 def count_steps(folder):
     return sum(int(str(n).split("-")[-1][:-4]) - 1 for n in folder.glob("*.npz"))
 
 
-def make_dataset(episodes, config):
-    generator = tools.sample_episodes(episodes, config.batch_length)
-    dataset = tools.from_generator(generator, config.batch_size)
-    return dataset
-
-
-def make_env(config, mode, id):
-    suite, task = config.task.split("_", 1)
-    if suite == "dmc":
-        import envs.dmc as dmc
-
-        env = dmc.DeepMindControl(
-            task, config.action_repeat, config.size, seed=config.seed + id
-        )
-        env = wrappers.NormalizeActions(env)
-    elif suite == "atari":
-        import envs.atari as atari
-
-        env = atari.Atari(
-            task,
-            config.action_repeat,
-            config.size,
-            gray=config.grayscale,
-            noops=config.noops,
-            lives=config.lives,
-            sticky=config.stickey,
-            actions=config.actions,
-            resize=config.resize,
-            seed=config.seed + id,
-        )
-        env = wrappers.OneHotAction(env)
-    elif suite == "dmlab":
-        import envs.dmlab as dmlab
-
-        env = dmlab.DeepMindLabyrinth(
-            task,
-            mode if "train" in mode else "test",
-            config.action_repeat,
-            seed=config.seed + id,
-        )
-        env = wrappers.OneHotAction(env)
-    elif suite == "memorymaze":
-        from envs.memorymaze import MemoryMaze
-
-        env = MemoryMaze(task, seed=config.seed + id)
-        env = wrappers.OneHotAction(env)
-    elif suite == "crafter":
-        import envs.crafter as crafter
-
-        env = crafter.Crafter(task, config.size, seed=config.seed + id)
-        env = wrappers.OneHotAction(env)
-    elif suite == "minecraft":
-        import envs.minecraft as minecraft
-
-        env = minecraft.make_env(task, size=config.size, break_speed=config.break_speed)
-        env = wrappers.OneHotAction(env)
-    else:
-        raise NotImplementedError(suite)
-    env = wrappers.TimeLimit(env, config.time_limit)
-    env = wrappers.SelectAction(env, key="action")
-    env = wrappers.UUID(env)
-    if suite == "minecraft":
-        env = wrappers.RewardObs(env)
-    return env
-
-
 def main(config):
     tools.set_seed_everywhere(config.seed)
-    if config.deterministic_run:
-        tools.enable_deterministic_run()
     logdir = pathlib.Path(config.logdir).expanduser()
+    logdir = logdir / "saved_models" / config.task / str(config.run_idx)
     config.traindir = config.traindir or logdir / "train_eps"
     config.evaldir = config.evaldir or logdir / "eval_eps"
     config.steps //= config.action_repeat
@@ -217,127 +165,53 @@ def main(config):
 
     print("Logdir", logdir)
     logdir.mkdir(parents=True, exist_ok=True)
-    config.traindir.mkdir(parents=True, exist_ok=True)
-    config.evaldir.mkdir(parents=True, exist_ok=True)
-    step = count_steps(config.traindir)
     # step in logger is environmental step
-    logger = tools.Logger(logdir, config.action_repeat * step)
+    print("Action Space", config.action_dim )
+    config.num_actions = 2
 
-    print("Create envs.")
-    if config.offline_traindir:
-        directory = config.offline_traindir.format(**vars(config))
-    else:
-        directory = config.traindir
-    train_eps = tools.load_episodes(directory, limit=config.dataset_size)
-    if config.offline_evaldir:
-        directory = config.offline_evaldir.format(**vars(config))
-    else:
-        directory = config.evaldir
-    eval_eps = tools.load_episodes(directory, limit=1)
-    make = lambda mode, id: make_env(config, mode, id)
-    train_envs = [make("train", i) for i in range(config.envs)]
-    eval_envs = [make("eval", i) for i in range(config.envs)]
-    if config.parallel:
-        train_envs = [Parallel(env, "process") for env in train_envs]
-        eval_envs = [Parallel(env, "process") for env in eval_envs]
-    else:
-        train_envs = [Damy(env) for env in train_envs]
-        eval_envs = [Damy(env) for env in eval_envs]
-    acts = train_envs[0].action_space
-    print("Action Space", acts)
-    config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
-
-    state = None
-    if not config.offline_traindir:
-        prefill = max(0, config.prefill - count_steps(config.traindir))
-        print(f"Prefill dataset ({prefill} steps).")
-        if hasattr(acts, "discrete"):
-            random_actor = tools.OneHotDist(
-                torch.zeros(config.num_actions).repeat(config.envs, 1)
-            )
-        else:
-            random_actor = torchd.independent.Independent(
-                torchd.uniform.Uniform(
-                    torch.tensor(acts.low).repeat(config.envs, 1),
-                    torch.tensor(acts.high).repeat(config.envs, 1),
-                ),
-                1,
-            )
-
-        def random_agent(o, d, s):
-            action = random_actor.sample()
-            logprob = random_actor.log_prob(action)
-            return {"action": action, "logprob": logprob}, None
-
-        state = tools.simulate(
-            random_agent,
-            train_envs,
-            train_eps,
-            config.traindir,
-            logger,
-            limit=config.dataset_size,
-            steps=prefill,
-        )
-        logger.step += prefill * config.action_repeat
-        print(f"Logger: ({logger.step} steps).")
-
-    print("Simulate agent.")
-    train_dataset = make_dataset(train_eps, config)
-    eval_dataset = make_dataset(eval_eps, config)
+    # here we should load the dataset
+    datasets, traj_dset = load_pusht_slice_train_val(data_path = '/data/jeff/workspace/pusht_dataset', with_velocity=False,n_rollout=5, transform=resize_image, frameskip=1, num_hist=config.batch_length)
+    train_dataset = datasets['train']
+    eval_dataset = datasets['valid']
+    train_dataset = DataLoader(train_dataset,batch_size=config.batch_size, shuffle=True)
+    eval_dataset = iter(DataLoader(eval_dataset,batch_size=config.batch_size, shuffle=True))
     agent = Dreamer(
-        train_envs[0].observation_space,
-        train_envs[0].action_space,
+        (64, 64, 3), # obs_space
+        (config.action_dim ,), # act_space
         config,
-        logger,
+        None,
         train_dataset,
     ).to(config.device)
     agent.requires_grad_(requires_grad=False)
-    if (logdir / "latest.pt").exists():
+    if (logdir / "latest.pt").exists() and config.continue_training: # load the latest model if exists
         checkpoint = torch.load(logdir / "latest.pt")
         agent.load_state_dict(checkpoint["agent_state_dict"])
         tools.recursively_load_optim_state_dict(agent, checkpoint["optims_state_dict"])
         agent._should_pretrain._once = False
 
     # make sure eval will be executed once after config.steps
-    while agent._step < config.steps + config.eval_every:
-        logger.write()
-        if config.eval_episode_num > 0:
-            print("Start evaluation.")
-            eval_policy = functools.partial(agent, training=False)
-            tools.simulate(
-                eval_policy,
-                eval_envs,
-                eval_eps,
-                config.evaldir,
-                logger,
-                is_eval=True,
-                episodes=config.eval_episode_num,
-            )
-            if config.video_pred_log:
-                video_pred = agent._wm.video_pred(next(eval_dataset))
-                logger.video("eval_openl", to_np(video_pred))
-        print("Start training.")
-        state = tools.simulate(
-            agent,
-            train_envs,
-            train_eps,
-            config.traindir,
-            logger,
-            limit=config.dataset_size,
-            steps=config.eval_every,
-            state=state,
-        )
+    accumulated_metric = []
+    for epoch in tqdm(range(config.epochs)):
+        if config.video_pred_log and epoch % config.save_video_every == 0:
+            print("eval_openl")
+            video_pred = agent._wm.video_pred(next(eval_dataset)) #!!! this is changed!
+            single_video_pred = video_pred[0].cpu()
+            single_video_pred = (single_video_pred * 255).clamp(0, 255).byte()
+            tvio.write_video(logdir / f"eval_openl{epoch}.mp4", single_video_pred, fps=30, video_codec='mpeg4')
+            
+        all_metrics = agent.train_one_epoch()
+        accumulated_metric.extend(all_metrics)
+        if epoch % config.save_accumulated_metric_every == 0:
+            data_to_save = accumulated_metric
+            with open(logdir / 'metrics.pkl', 'wb') as f:
+                pickle.dump(data_to_save, f)
+
         items_to_save = {
             "agent_state_dict": agent.state_dict(),
             "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
         }
+        torch.save(items_to_save, logdir / f"{epoch}.pt")
         torch.save(items_to_save, logdir / "latest.pt")
-    for env in train_envs + eval_envs:
-        try:
-            env.close()
-        except Exception:
-            pass
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
