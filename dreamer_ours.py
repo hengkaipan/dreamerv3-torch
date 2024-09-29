@@ -210,7 +210,8 @@ def main(config):
             "agent_state_dict": agent.state_dict(),
             "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
         }
-        torch.save(items_to_save, logdir / f"{epoch}.pt")
+        if epoch % config.save_checkpoints_every == 0:
+            torch.save(items_to_save, logdir / f"{epoch}.pt")
         torch.save(items_to_save, logdir / "latest.pt")
 
 if __name__ == "__main__":

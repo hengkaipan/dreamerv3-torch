@@ -8,6 +8,7 @@ defaults:
   continue_training: False
   save_video_every: 20
   save_accumulated_metric_every: 20
+  save_checkpoints_every: 50
   batch_length: 64 # this is num_hist in our case
   batch_size: 16
   # END FOR
