@@ -87,6 +87,11 @@ class DreamerPlanner(nn.Module):
         )
         recon = self._wm.heads["decoder"](self._wm.dynamics.get_feat(states))["image"].mode()
         recon = torch.cat([recon[:, 0:1], recon], dim=1) # repeat the first frame of recon
+        if t == 0:
+            encoded_recon = self.encode_obs({"visual": recon})['visual']
+            encoded_recon = {'visual': encoded_recon}
+            recon = einops.rearrange(recon, "b t h w c -> b t c h w")
+            return encoded_recon, recon
         init = {k: v[:, -1] for k, v in states.items()}
         prior = self._wm.dynamics.imagine_with_action(future_act, init)
         decoded_predict = self._wm.heads["decoder"](self._wm.dynamics.get_feat(prior))["image"].mode()
